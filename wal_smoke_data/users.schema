@@ -1,0 +1,3 @@
+id	DECIMAL	PK
+name	VARCHAR	
+expires_at	DECIMAL	
