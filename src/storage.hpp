@@ -15,7 +15,7 @@ public:
     ~StorageEngine();
 
     void load();
-    QueryResult execute(Command command);
+    QueryResult execute(const Command &command);
 
 private:
     struct RowRecord {
@@ -60,11 +60,10 @@ private:
     };
 
     QueryResult create_table(const CreateTableCommand &command);
-    QueryResult insert_row(InsertCommand command);
+    QueryResult insert_row(const InsertCommand &command);
     QueryResult select_rows(const SelectCommand &command);
 
     bool is_expired(const RowRecord &row) const;
-    bool is_expired(const RowRecord &row, long long now_epoch) const;
     std::optional<std::size_t> find_primary_key_column(const Table &table) const;
     std::size_t require_column(const Table &table, const std::string &name) const;
     std::pair<const Table&, const Table*> resolve_tables(const SelectCommand &command) const;
@@ -77,16 +76,12 @@ private:
         const Table *right_table,
         const RowRecord *right_row) const;
     std::string normalize_column_name(const std::string &expr, const std::string &default_table) const;
-    RowRecord make_row_record(
-        const Table &table,
-        std::vector<std::string> values,
-        const std::string &expires_at,
-        long long expires_at_epoch) const;
+    RowRecord make_row_record(const Table &table, const std::vector<std::string> &values, const std::optional<std::string> &expires_at) const;
     std::string parse_expiry(const std::optional<std::string> &expires_at) const;
     std::string build_transaction_payload(long long txid, const std::vector<RowRecord> &rows, bool include_table_name, const std::string &table_name) const;
     void append_wal_record(long long txid, const std::string &table_name, const std::vector<RowRecord> &rows);
     void append_rows_to_disk(const Table &table, long long txid, const std::vector<RowRecord> &rows);
-    void apply_rows_in_memory(Table &table, std::vector<RowRecord> &rows);
+    void apply_rows_in_memory(Table &table, const std::vector<RowRecord> &rows);
     void replay_wal();
     void load_wal();
     std::vector<WalTransaction> parse_wal_stream(std::istream &in) const;
@@ -104,7 +99,6 @@ private:
     mutable std::shared_mutex mutex_;
     std::unordered_map<std::string, Table> tables_;
     QueryCache cache_{128};
-    unsigned long long cache_epoch_ = 0;
     std::unordered_set<long long> applied_txids_;
     int wal_fd_ = -1;
     long long next_txid_ = 1;

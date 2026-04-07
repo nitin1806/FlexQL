@@ -130,8 +130,8 @@ Progress: 9000000/10000000
 Progress: 10000000/10000000
 [PASS] INSERT benchmark complete
 Rows inserted: 10000000
-Elapsed: 207380 ms
-Throughput: 48220 rows/sec
+Elapsed: 48243 ms
+Throughput: 207283 rows/sec
 ```
 
 This large-dataset run shows that FlexQL completed a 10 million row sequential insert workload at approximately `48,220 rows/sec` while continuing into the functional test phase afterward.

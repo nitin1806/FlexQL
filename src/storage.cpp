@@ -54,53 +54,15 @@ std::vector<std::string> split_tsv(const std::string &line) {
     return parts;
 }
 
-void append_escaped_field(std::string &out, const std::string &value) {
-    for (char c : value) {
-        switch (c) {
-            case '\\': out += "\\\\"; break;
-            case '\t': out += "\\t"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            default: out.push_back(c); break;
+std::string join_escaped_values(const std::vector<std::string> &values) {
+    std::ostringstream out;
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) {
+            out << '\t';
         }
+        out << escape_field(values[i]);
     }
-}
-
-template <typename Rows>
-std::size_t estimate_payload_size(
-    long long txid,
-    const Rows &rows,
-    bool include_table_name,
-    const std::string &table_name) {
-    std::size_t size = 32 + std::to_string(txid).size() + std::to_string(rows.size()).size();
-    if (include_table_name) {
-        size += table_name.size() + 1;
-    }
-    for (const auto &row : rows) {
-        size += 16 + std::to_string(txid).size() + row.expires_at.size();
-        for (const auto &value : row.values) {
-            size += value.size() + 1;
-        }
-    }
-    return size;
-}
-
-void write_all_or_throw(int fd, const std::string &payload, const char *context) {
-    std::size_t total_written = 0;
-    while (total_written < payload.size()) {
-        const ssize_t written = ::write(fd, payload.data() + total_written, payload.size() - total_written);
-        if (written < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            const int err = errno;
-            throw std::runtime_error(std::string(context) + ": " + std::string(std::strerror(err)));
-        }
-        if (written == 0) {
-            throw std::runtime_error(std::string(context) + ": short write");
-        }
-        total_written += static_cast<std::size_t>(written);
-    }
+    return out.str();
 }
 
 }  // namespace
@@ -110,6 +72,7 @@ std::optional<QueryResult> StorageEngine::QueryCache::get(const std::string &key
     if (it == index_.end()) {
         return std::nullopt;
     }
+    items_.splice(items_.begin(), items_, it->second);
     return it->second->value;
 }
 
@@ -157,15 +120,14 @@ void StorageEngine::load() {
     load_wal();
     replay_wal();
     cache_.clear();
-    ++cache_epoch_;
 }
 
-QueryResult StorageEngine::execute(Command command) {
+QueryResult StorageEngine::execute(const Command &command) {
     switch (command.type) {
         case CommandType::CreateTable:
             return create_table(command.create_table);
         case CommandType::Insert:
-            return insert_row(std::move(command.insert));
+            return insert_row(command.insert);
         case CommandType::Select:
             return select_rows(command.select);
     }
@@ -201,11 +163,10 @@ QueryResult StorageEngine::create_table(const CreateTableCommand &command) {
     ensure_data_file_open(table);
     tables_[table.name] = table;
     cache_.clear();
-    ++cache_epoch_;
     return QueryResult{{"status"}, {{"table created"}}};
 }
 
-QueryResult StorageEngine::insert_row(InsertCommand command) {
+QueryResult StorageEngine::insert_row(const InsertCommand &command) {
     std::unique_lock lock(mutex_);
     auto it = tables_.find(command.table_name);
     if (it == tables_.end()) {
@@ -215,11 +176,8 @@ QueryResult StorageEngine::insert_row(InsertCommand command) {
     std::vector<RowRecord> rows_to_insert;
     rows_to_insert.reserve(command.rows.size());
     std::unordered_map<std::string, std::size_t> batch_primary_keys;
-    batch_primary_keys.reserve(command.rows.size());
-    const std::string parsed_expiry = parse_expiry(command.expires_at);
-    const long long parsed_expiry_epoch = parse_epoch_string(parsed_expiry);
-    for (auto &input_row : command.rows) {
-        RowRecord row = make_row_record(table, std::move(input_row), parsed_expiry, parsed_expiry_epoch);
+    for (const auto &input_row : command.rows) {
+        RowRecord row = make_row_record(table, input_row, command.expires_at);
         if (table.primary_key_column) {
             const std::string &pk_value = row.values[*table.primary_key_column];
             if (table.primary_index.contains(pk_value) || batch_primary_keys.contains(pk_value)) {
@@ -236,7 +194,6 @@ QueryResult StorageEngine::insert_row(InsertCommand command) {
     apply_rows_in_memory(table, rows_to_insert);
     applied_txids_.insert(txid);
     cache_.clear();
-    ++cache_epoch_;
     return QueryResult{{"status"}, {{std::to_string(command.rows.size()) + " row(s) inserted"}}};
 }
 
@@ -252,135 +209,125 @@ QueryResult StorageEngine::select_rows(const SelectCommand &command) {
         return oss.str();
     }();
 
-    unsigned long long cache_epoch = 0;
     {
-        std::shared_lock lock(mutex_);
+        std::unique_lock lock(mutex_);
         if (auto cached = cache_.get(cache_key)) {
             return *cached;
         }
-        cache_epoch = cache_epoch_;
-        const auto [left_table, right_table] = resolve_tables(command);
-        const long long now_epoch = current_epoch_seconds();
+    }
 
-        QueryResult result;
-        if (command.columns.size() == 1 && trim(command.columns.front()) == "*") {
-            for (const auto &column : left_table.columns) {
-                result.columns.push_back(left_table.name + "." + column.name);
-            }
-            if (right_table != nullptr) {
-                for (const auto &column : right_table->columns) {
-                    result.columns.push_back(right_table->name + "." + column.name);
-                }
-            }
-        } else {
-            for (const auto &column : command.columns) {
-                result.columns.push_back(trim(column));
+    std::unique_lock lock(mutex_);
+    const auto [left_table, right_table] = resolve_tables(command);
+
+    QueryResult result;
+    if (command.columns.size() == 1 && trim(command.columns.front()) == "*") {
+        for (const auto &column : left_table.columns) {
+            result.columns.push_back(left_table.name + "." + column.name);
+        }
+        if (right_table != nullptr) {
+            for (const auto &column : right_table->columns) {
+                result.columns.push_back(right_table->name + "." + column.name);
             }
         }
+    } else {
+        for (const auto &column : command.columns) {
+            result.columns.push_back(trim(column));
+        }
+    }
 
-        const auto emit_row = [&](const RowRecord &left_row, const RowRecord *right_row) {
-            if (is_expired(left_row, now_epoch) || (right_row != nullptr && is_expired(*right_row, now_epoch))) {
-                return;
-            }
-            if (command.where_condition &&
-                !evaluate_condition(*command.where_condition, left_table, left_row, right_table, right_row)) {
-                return;
-            }
+    const auto emit_row = [&](const RowRecord &left_row, const RowRecord *right_row) {
+        if (is_expired(left_row) || (right_row != nullptr && is_expired(*right_row))) {
+            return;
+        }
+        if (command.where_condition &&
+            !evaluate_condition(*command.where_condition, left_table, left_row, right_table, right_row)) {
+            return;
+        }
 
-            std::vector<std::string> output_row;
-            output_row.reserve(result.columns.size());
-            if (command.columns.size() == 1 && trim(command.columns.front()) == "*") {
-                output_row.insert(output_row.end(), left_row.values.begin(), left_row.values.end());
-                if (right_row != nullptr) {
-                    output_row.insert(output_row.end(), right_row->values.begin(), right_row->values.end());
-                }
-            } else {
-                for (const auto &expr : command.columns) {
-                    const std::string column = trim(expr);
-                    if (column.find('.') != std::string::npos) {
-                        const std::string table_name = column.substr(0, column.find('.'));
-                        if (table_name == left_table.name) {
-                            output_row.push_back(get_value(left_table, left_row, column));
-                        } else if (right_table != nullptr && table_name == right_table->name) {
-                            output_row.push_back(get_value(*right_table, *right_row, column));
-                        } else {
-                            throw std::runtime_error("unknown qualified column: " + column);
-                        }
+        std::vector<std::string> output_row;
+        if (command.columns.size() == 1 && trim(command.columns.front()) == "*") {
+            output_row.insert(output_row.end(), left_row.values.begin(), left_row.values.end());
+            if (right_row != nullptr) {
+                output_row.insert(output_row.end(), right_row->values.begin(), right_row->values.end());
+            }
+        } else {
+            for (const auto &expr : command.columns) {
+                const std::string column = trim(expr);
+                if (column.find('.') != std::string::npos) {
+                    const std::string table_name = column.substr(0, column.find('.'));
+                    if (table_name == left_table.name) {
+                        output_row.push_back(get_value(left_table, left_row, column));
+                    } else if (right_table != nullptr && table_name == right_table->name) {
+                        output_row.push_back(get_value(*right_table, *right_row, column));
                     } else {
-                        if (left_table.column_index.contains(column)) {
-                            output_row.push_back(get_value(left_table, left_row, column));
-                        } else if (right_table != nullptr && right_table->column_index.contains(column)) {
-                            output_row.push_back(get_value(*right_table, *right_row, column));
-                        } else {
-                            throw std::runtime_error("unknown column: " + column);
-                        }
+                        throw std::runtime_error("unknown qualified column: " + column);
+                    }
+                } else {
+                    if (left_table.column_index.contains(column)) {
+                        output_row.push_back(get_value(left_table, left_row, column));
+                    } else if (right_table != nullptr && right_table->column_index.contains(column)) {
+                        output_row.push_back(get_value(*right_table, *right_row, column));
+                    } else {
+                        throw std::runtime_error("unknown column: " + column);
                     }
                 }
             }
-            result.rows.push_back(std::move(output_row));
-        };
+        }
+        result.rows.push_back(std::move(output_row));
+    };
 
-        if (right_table == nullptr) {
-            bool used_primary_index = false;
-            if (command.where_condition && command.where_condition->op == CompareOp::Eq && !command.where_condition->rhs_is_column) {
-                const std::string column_name = trim(command.where_condition->lhs);
-                const std::string plain_name = column_name.find('.') == std::string::npos
-                    ? column_name
-                    : column_name.substr(column_name.find('.') + 1);
-                if ((column_name.find('.') == std::string::npos || column_name.rfind(left_table.name + ".", 0) == 0) &&
-                    left_table.primary_key_column &&
-                    left_table.columns[*left_table.primary_key_column].name == plain_name) {
-                    const auto pk_it = left_table.primary_index.find(command.where_condition->rhs);
-                    used_primary_index = true;
-                    if (pk_it != left_table.primary_index.end()) {
-                        const auto &left_row = left_table.rows[pk_it->second];
-                        if (!left_row.deleted) {
-                            emit_row(left_row, nullptr);
-                        }
-                    }
-                }
-            }
-            if (!used_primary_index) {
-                for (const auto &left_row : left_table.rows) {
+    if (right_table == nullptr) {
+        bool used_primary_index = false;
+        if (command.where_condition && command.where_condition->op == CompareOp::Eq && !command.where_condition->rhs_is_column) {
+            const std::string column_name = trim(command.where_condition->lhs);
+            const std::string plain_name = column_name.find('.') == std::string::npos
+                ? column_name
+                : column_name.substr(column_name.find('.') + 1);
+            if ((column_name.find('.') == std::string::npos || column_name.rfind(left_table.name + ".", 0) == 0) &&
+                left_table.primary_key_column &&
+                left_table.columns[*left_table.primary_key_column].name == plain_name) {
+                const auto pk_it = left_table.primary_index.find(command.where_condition->rhs);
+                used_primary_index = true;
+                if (pk_it != left_table.primary_index.end()) {
+                    const auto &left_row = left_table.rows[pk_it->second];
                     if (!left_row.deleted) {
                         emit_row(left_row, nullptr);
                     }
                 }
             }
-        } else {
-            if (!command.join_condition) {
-                throw std::runtime_error("JOIN requires a join condition");
-            }
+        }
+        if (!used_primary_index) {
             for (const auto &left_row : left_table.rows) {
-                if (left_row.deleted) {
+                if (!left_row.deleted) {
+                    emit_row(left_row, nullptr);
+                }
+            }
+        }
+    } else {
+        if (!command.join_condition) {
+            throw std::runtime_error("JOIN requires a join condition");
+        }
+        for (const auto &left_row : left_table.rows) {
+            if (left_row.deleted) {
+                continue;
+            }
+            for (const auto &right_row : right_table->rows) {
+                if (right_row.deleted) {
                     continue;
                 }
-                for (const auto &right_row : right_table->rows) {
-                    if (right_row.deleted) {
-                        continue;
-                    }
-                    if (evaluate_condition(*command.join_condition, left_table, left_row, right_table, &right_row)) {
-                        emit_row(left_row, &right_row);
-                    }
+                if (evaluate_condition(*command.join_condition, left_table, left_row, right_table, &right_row)) {
+                    emit_row(left_row, &right_row);
                 }
             }
         }
-        lock.unlock();
-
-        std::unique_lock cache_lock(mutex_);
-        if (cache_epoch_ == cache_epoch) {
-            cache_.put(cache_key, result);
-        }
-        return result;
     }
+
+    cache_.put(cache_key, result);
+    return result;
 }
 
 bool StorageEngine::is_expired(const RowRecord &row) const {
-    return is_expired(row, current_epoch_seconds());
-}
-
-bool StorageEngine::is_expired(const RowRecord &row, long long now_epoch) const {
-    return row.expires_at_epoch <= now_epoch;
+    return row.expires_at_epoch <= current_epoch_seconds();
 }
 
 std::optional<std::size_t> StorageEngine::find_primary_key_column(const Table &table) const {
@@ -475,9 +422,8 @@ bool StorageEngine::evaluate_condition(
 
 StorageEngine::RowRecord StorageEngine::make_row_record(
     const Table &table,
-    std::vector<std::string> values,
-    const std::string &expires_at,
-    long long expires_at_epoch) const {
+    const std::vector<std::string> &values,
+    const std::optional<std::string> &expires_at) const {
     if (values.size() != table.columns.size()) {
         throw std::runtime_error("value count does not match schema");
     }
@@ -493,9 +439,9 @@ StorageEngine::RowRecord StorageEngine::make_row_record(
     }
 
     RowRecord row;
-    row.values = std::move(values);
-    row.expires_at = expires_at;
-    row.expires_at_epoch = expires_at_epoch;
+    row.values = values;
+    row.expires_at = parse_expiry(expires_at);
+    row.expires_at_epoch = parse_epoch_string(row.expires_at);
     return row;
 }
 
@@ -513,38 +459,21 @@ std::string StorageEngine::build_transaction_payload(
     const std::vector<RowRecord> &rows,
     bool include_table_name,
     const std::string &table_name) const {
-    std::string payload;
-    payload.reserve(estimate_payload_size(txid, rows, include_table_name, table_name));
-    const std::string txid_text = std::to_string(txid);
-    payload += "BEGIN\t";
-    payload += txid_text;
+    std::ostringstream payload_stream;
+    payload_stream << "BEGIN\t" << txid;
     if (include_table_name) {
-        payload.push_back('\t');
-        append_escaped_field(payload, table_name);
+        payload_stream << '\t' << escape_field(table_name);
     }
-    payload.push_back('\t');
-    payload += std::to_string(rows.size());
-    payload.push_back('\n');
+    payload_stream << '\t' << rows.size() << '\n';
     for (const auto &row : rows) {
-        payload += "ROW\t";
-        payload += txid_text;
-        payload.push_back('\t');
-        append_escaped_field(payload, row.expires_at);
+        payload_stream << "ROW\t" << txid << '\t' << escape_field(row.expires_at);
         if (!row.values.empty()) {
-            payload.push_back('\t');
-            for (std::size_t i = 0; i < row.values.size(); ++i) {
-                if (i != 0) {
-                    payload.push_back('\t');
-                }
-                append_escaped_field(payload, row.values[i]);
-            }
+            payload_stream << '\t' << join_escaped_values(row.values);
         }
-        payload.push_back('\n');
+        payload_stream << '\n';
     }
-    payload += "COMMIT\t";
-    payload += txid_text;
-    payload.push_back('\n');
-    return payload;
+    payload_stream << "COMMIT\t" << txid << '\n';
+    return payload_stream.str();
 }
 
 void StorageEngine::append_wal_record(long long txid, const std::string &table_name, const std::vector<RowRecord> &rows) {
@@ -555,7 +484,11 @@ void StorageEngine::append_wal_record(long long txid, const std::string &table_n
         }
     }
     const std::string payload = build_transaction_payload(txid, rows, true, table_name);
-    write_all_or_throw(wal_fd_, payload, "failed to write WAL");
+    ssize_t written = ::write(wal_fd_, payload.data(), payload.size());
+    if (written != static_cast<ssize_t>(payload.size())) {
+        int err = errno;
+        throw std::runtime_error("failed to write WAL: " + std::string(std::strerror(err)));
+    }
     if (::fdatasync(wal_fd_) != 0) {
         int err = errno;
         throw std::runtime_error("failed to sync WAL: " + std::string(std::strerror(err)));
@@ -564,21 +497,24 @@ void StorageEngine::append_wal_record(long long txid, const std::string &table_n
 
 void StorageEngine::append_rows_to_disk(const Table &table, long long txid, const std::vector<RowRecord> &rows) {
     const std::string payload = build_transaction_payload(txid, rows, false, "");
-    write_all_or_throw(table.data_fd, payload, "failed to write row");
+    ssize_t written = ::write(table.data_fd, payload.data(), payload.size());
+    if (written != static_cast<ssize_t>(payload.size())) {
+        int err = errno;
+        throw std::runtime_error("failed to write row: " + std::string(std::strerror(err)));
+    }
     if (::fdatasync(table.data_fd) != 0) {
         int err = errno;
         throw std::runtime_error("failed to sync row write: " + std::string(std::strerror(err)));
     }
 }
 
-void StorageEngine::apply_rows_in_memory(Table &table, std::vector<RowRecord> &rows) {
-    table.rows.reserve(table.rows.size() + rows.size());
+void StorageEngine::apply_rows_in_memory(Table &table, const std::vector<RowRecord> &rows) {
     const std::size_t base_index = table.rows.size();
     for (std::size_t i = 0; i < rows.size(); ++i) {
         if (table.primary_key_column && !is_expired(rows[i])) {
             table.primary_index[rows[i].values[*table.primary_key_column]] = base_index + i;
         }
-        table.rows.push_back(std::move(rows[i]));
+        table.rows.push_back(rows[i]);
     }
 }
 
@@ -805,8 +741,7 @@ void StorageEngine::load_wal() {
 
 void StorageEngine::replay_wal() {
     std::ifstream in(wal_path());
-    auto transactions = parse_wal_stream(in);
-    for (auto &tx : transactions) {
+    for (const auto &tx : parse_wal_stream(in)) {
         if (applied_txids_.contains(tx.txid)) {
             continue;
         }

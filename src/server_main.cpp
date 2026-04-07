@@ -16,8 +16,8 @@ void serve_client(int client_fd, flexql::StorageEngine &engine) {
             continue;
         }
         try {
-            auto command = flexql::parse_sql(sql);
-            const auto result = engine.execute(std::move(command));
+            const auto command = flexql::parse_sql(sql);
+            const auto result = engine.execute(command);
             if (!flexql::send_all(client_fd, flexql::encode_result(result))) {
                 break;
             }
